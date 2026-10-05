@@ -12,9 +12,12 @@ One run uses one provider for the whole benchmark — no mid-run failover, so co
 from __future__ import annotations
 
 import importlib
+import json
 import os
+import re
 import time
 from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Any
 
 PROVIDERS = {
@@ -37,6 +40,8 @@ PRICES_PER_M = {
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
     "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.5-flash-lite": (0.10, 0.40),
+    "gemini-3.8-flash": (0.10, 0.40),
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -114,30 +119,52 @@ class MeteredLLM:
         self._embed_client = (self._chat_client if self.embed_provider == self.chat_provider
                               else _openai_client(self.embed_provider))
 
+        self._cache_file = Path(".embeddings_cache.json")
+        self._embed_cache: dict[str, dict[str, Any]] = {}
+        if self._cache_file.exists():
+            try:
+                self._embed_cache = json.loads(self._cache_file.read_text(encoding="utf-8"))
+            except Exception:
+                self._embed_cache = {}
+
     def chat(self, prompt: str, json_mode: bool = False) -> str:
-        start = time.perf_counter()
-        if self.chat_provider == "anthropic":
-            text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
-        else:
-            if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                )
-            text, model = response.choices[0].message.content or "", self.chat_model_id
-            usage = response.usage
-            tokens_in = usage.prompt_tokens if usage else 0
-            tokens_out = usage.completion_tokens if usage else 0
-        self.usage += Usage(1, tokens_in, tokens_out, price(model, tokens_in, tokens_out), time.perf_counter() - start)
-        return _strip_fences(text) if json_mode else text
+        for attempt in range(10):
+            try:
+                start = time.perf_counter()
+                if self.chat_provider == "anthropic":
+                    text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
+                else:
+                    if json_mode and self.chat_provider != "gemini":
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                            response_format={"type": "json_object"},
+                        )
+                    else:
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                        )
+                    text, model = response.choices[0].message.content or "", self.chat_model_id
+                    usage = response.usage
+                    tokens_in = usage.prompt_tokens if usage else 0
+                    tokens_out = usage.completion_tokens if usage else 0
+                self.usage += Usage(1, tokens_in, tokens_out, price(model, tokens_in, tokens_out), time.perf_counter() - start)
+                if self.chat_provider == "gemini":
+                    time.sleep(4.2)
+                return _strip_fences(text) if json_mode else text
+            except Exception as e:
+                err_msg = str(e)
+                if any(x in err_msg for x in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "500", "502", "InternalServerError"]):
+                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_msg)
+                    delay = float(match.group(1)) + 2.0 if match else (15.0 * (attempt + 1))
+                    print(f"      [Chat Retry {attempt+1}/10] Đang chờ {delay:.1f}s do tải API/rate limit...", flush=True)
+                    time.sleep(delay)
+                else:
+                    raise
+        raise RuntimeError("Failed to chat after multiple retries due to rate limit")
 
     def _chat_anthropic(self, prompt: str) -> tuple[str, str, int, int]:
         # Claude Opus 5.5: thinking is always on and sampling params are removed; effort is the cost lever.
@@ -157,10 +184,37 @@ class MeteredLLM:
         return text, response.model, response.usage.input_tokens, response.usage.output_tokens
 
     def embed(self, text: str) -> list[float]:
-        start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
-        tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
-        self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
-        return [float(value) for value in response.data[0].embedding]
+        if text in self._embed_cache:
+            entry = self._embed_cache[text]
+            tokens = entry.get("tokens", 0)
+            self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), 0.001)
+            return entry["vector"]
+
+        for attempt in range(10):
+            try:
+                start = time.perf_counter()
+                response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+                tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
+                vector = [float(value) for value in response.data[0].embedding]
+                self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
+                self._embed_cache[text] = {"tokens": tokens, "vector": vector}
+                if len(self._embed_cache) % 10 == 0:
+                    try:
+                        self._cache_file.write_text(json.dumps(self._embed_cache), encoding="utf-8")
+                    except Exception:
+                        pass
+                if self.embed_provider == "gemini":
+                    time.sleep(0.65)
+                return vector
+            except Exception as e:
+                err_msg = str(e)
+                if any(x in err_msg for x in ["429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "500", "502", "InternalServerError"]):
+                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_msg)
+                    delay = float(match.group(1)) + 2.0 if match else (25.0 * (attempt + 1))
+                    print(f"      [Embed Retry {attempt+1}/10] Đang chờ {delay:.1f}s do rate limit...", flush=True)
+                    time.sleep(delay)
+                else:
+                    raise
+        raise RuntimeError("Failed to embed after multiple retries due to rate limit")
 
     __call__ = embed
